@@ -23,14 +23,25 @@ YF_PERIOD = os.getenv("YFINANCE_PERIOD", "5d")
 YF_INTERVAL = os.getenv("YFINANCE_INTERVAL", "15m")
 MAX_AGE_MIN = int(os.getenv("MAX_DATA_AGE_MINUTES", "45"))
 RISK_PCT = float(os.getenv("DEFAULT_RISK_PERCENT", "1.0"))
+EMA_FAST = int(os.getenv("EMA_FAST", "20"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
+CONTRACT_UNITS_PER_LOT = float(os.getenv("CONTRACT_UNITS_PER_LOT", "100000"))
+PRICE_VALUE_PER_UNIT = float(os.getenv("PRICE_VALUE_PER_UNIT", "1.0"))
 DB_PATH = ROOT / "data" / "bot.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smart-bot")
 
-CURRENCIES = ["EUR", "GBP", "AUD", "NZD", "USD", "CAD", "CHF", "JPY"]
-YAHOO_SYMBOLS = {f"{a}{b}": f"{a}{b}=X" for a in CURRENCIES for b in CURRENCIES if a != b}
-YAHOO_SYMBOLS.update({"XAUUSD": "XAUUSD=X", "XAGUSD": "XAGUSD=X", "BTCUSD": "BTC-USD"})
+# Canonical MT5 symbols: base currency first, quote currency second.
+# Yahoo tickers are only the read-only data adapter; execution/quotes are not MT5.
+MT5_SYMBOLS = [
+    "EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF", "USDJPY",
+    "EURGBP", "EURAUD", "EURNZD", "EURCAD", "EURCHF", "EURJPY",
+    "GBPAUD", "GBPNZD", "GBPCAD", "GBPCHF", "GBPJPY",
+    "AUDNZD", "AUDCAD", "AUDCHF", "AUDJPY", "NZDCAD", "NZDCHF", "NZDJPY",
+    "CADCHF", "CADJPY", "CHFJPY", "XAUUSD", "XAGUSD", "BTCUSD",
+]
+YAHOO_SYMBOLS = {symbol: ("BTC-USD" if symbol == "BTCUSD" else f"{symbol}=X") for symbol in MT5_SYMBOLS}
 
 @dataclass
 class Signal:
@@ -42,6 +53,7 @@ class Signal:
     stop_distance: float
     confidence: str
     observed_at: str
+    source: str = "Yahoo Finance delayed/read-only"
 
 
 TRADE_STYLES = {
@@ -60,7 +72,21 @@ def db():
     CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY, chat_id INTEGER, asset TEXT, side TEXT, price REAL, rsi REAL, pattern TEXT, stop_distance REAL, risk_pct REAL, observed_at TEXT, status TEXT DEFAULT 'open', outcome REAL, checked_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_signals_user ON signals(chat_id, observed_at);
     """)
+    _add_columns(conn, "users", {"alerts_enabled": "INTEGER DEFAULT 1"})
+    _add_columns(conn, "signals", {
+        "selected_style": "TEXT",
+        "rating": "INTEGER",
+        "profit_reserved": "INTEGER DEFAULT 0",
+        "last_refresh": "TEXT",
+    })
     return conn
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def now_iso() -> str:
@@ -113,6 +139,8 @@ def analyze(asset: str, symbol: str) -> Signal | None:
     data, observed = fetch(symbol)
     close = data["Close"].astype(float)
     data["rsi"] = rsi(close)
+    data["ema_fast"] = close.ewm(span=EMA_FAST, adjust=False).mean()
+    data["ema_slow"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
     prev, last = data.iloc[-2], data.iloc[-1]
     body_prev = abs(float(prev.Close - prev.Open))
     body_last = abs(float(last.Close - last.Open))
@@ -120,15 +148,20 @@ def analyze(asset: str, symbol: str) -> Signal | None:
     bearish_engulf = prev.Close > prev.Open and last.Close < last.Open and last.Open >= prev.Close and last.Close <= prev.Open and body_last >= body_prev
     current_rsi = float(data["rsi"].iloc[-1])
     side, pattern = None, None
-    if bullish_engulf and current_rsi <= 45:
+    bullish_trend = float(last.Close) > float(last.ema_fast) > float(last.ema_slow)
+    bearish_trend = float(last.Close) < float(last.ema_fast) < float(last.ema_slow)
+    # The RSI bands are deliberately asymmetric to avoid treating every
+    # engulfing candle as a signal in the middle of a range.
+    if bullish_engulf and bullish_trend and 30 <= current_rsi <= 48:
         side, pattern = "BUY", "Bullish Engulfing"
-    elif bearish_engulf and current_rsi >= 55:
+    elif bearish_engulf and bearish_trend and 52 <= current_rsi <= 70:
         side, pattern = "SELL", "Bearish Engulfing"
     if not side:
         return None
     price = float(last.Close)
     candle_range = max(float(last.High - last.Low), price * 0.001)
-    return Signal(asset, side, price, current_rsi, pattern, candle_range, "medium", observed)
+    confidence = "high" if (current_rsi <= 40 or current_rsi >= 60) else "medium"
+    return Signal(asset, side, price, current_rsi, pattern, candle_range, confidence, observed)
 
 
 def signal_keyboard(signal_id: int) -> InlineKeyboardMarkup:
@@ -136,19 +169,36 @@ def signal_keyboard(signal_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(TRADE_STYLES["scalp"]["label"], callback_data=f"targets:{signal_id}:scalp")],
         [InlineKeyboardButton(TRADE_STYLES["medium"]["label"], callback_data=f"targets:{signal_id}:medium")],
         [InlineKeyboardButton(TRADE_STYLES["long"]["label"], callback_data=f"targets:{signal_id}:long")],
+        [InlineKeyboardButton("🔄 تحديث التحليل", callback_data=f"refresh:{signal_id}"), InlineKeyboardButton("🔔 التنبيهات", callback_data=f"alerts:{signal_id}")],
+        [InlineKeyboardButton("💰 حجز الأرباح (خطة)", callback_data=f"reserve:{signal_id}")],
+        [InlineKeyboardButton("⭐ قيّم الإشارة", callback_data=f"rate:{signal_id}")],
+    ])
+
+
+def rating_keyboard(signal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(str(value), callback_data=f"rating:{signal_id}:{value}") for value in range(1, 6)
+    ]])
+
+
+def management_keyboard(signal_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث التحليل", callback_data=f"refresh:{signal_id}"), InlineKeyboardButton("🔔 التنبيهات", callback_data=f"alerts:{signal_id}")],
+        [InlineKeyboardButton("💰 حجز الأرباح (خطة)", callback_data=f"reserve:{signal_id}"), InlineKeyboardButton("⭐ تقييم", callback_data=f"rate:{signal_id}")],
     ])
 
 
 def format_signal(sig: Signal, balance: Optional[float]) -> str:
     risk_amount = (balance or 0) * RISK_PCT / 100
-    size = (risk_amount / sig.stop_distance) if risk_amount > 0 else None
-    sizing = f"حجم نظري: {size:.4f}" if size else "الحجم النظري: أدخل الرصيد عبر /setbalance"
+    units = (risk_amount / (sig.stop_distance * PRICE_VALUE_PER_UNIT)) if risk_amount > 0 else None
+    lots = (units / CONTRACT_UNITS_PER_LOT) if units else None
+    sizing = (f"حجم نظري: {units:.2f} وحدة ≈ {lots:.4f} لوت" if units else "الحجم النظري: أدخل الرصيد عبر /setbalance")
     return (f"فرصة تحليلية جديدة — {sig.asset}\n الاتجاه: {sig.side}\n السعر المرجعي: {sig.price:.6g}\n"
             f"RSI: {sig.rsi:.2f} | النموذج: {sig.pattern}\nوقف نموذجي: {sig.stop_distance:.6g}\n"
             f"مخاطرة النموذج: {RISK_PCT:.2f}% | {sizing}\n"
-            f"الثقة: {sig.confidence}\nوقت القراءة UTC: {sig.observed_at}\n"
+            f"الثقة: {sig.confidence}\nوقت القراءة UTC: {sig.observed_at}\nالمصدر: {sig.source}\n"
             "اختر نوع الصفقة لحساب SL وTP1 وTP2 وTP3 ديناميكياً:\n"
-            "تنبيه: هذه إشارة غير تنفيذية وليست ضماناً أو توصية مالية. تحقق من السعر والسبريد بنفسك.")
+            "تنبيه: الأسعار مرجعية وليست MT5 تنفيذية؛ تحقق من السعر والسبريد بنفسك.")
 
 
 def format_targets(asset: str, side: str, entry: float, candle_range: float, style_key: str) -> str:
@@ -226,17 +276,81 @@ async def targets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("هذه الإشارة غير متاحة لهذه المحادثة.")
         return
     _, asset, side, entry, candle_range = row
-    await query.message.reply_text(format_targets(asset, side, float(entry), float(candle_range), style_key))
+    with db() as c:
+        c.execute("UPDATE signals SET selected_style=? WHERE id=?", (style_key, signal_id))
+    await query.message.reply_text(format_targets(asset, side, float(entry), float(candle_range), style_key), reply_markup=management_keyboard(signal_id))
+
+
+async def management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        action, signal_id_text = query.data.split(":", 1)
+        signal_id = int(signal_id_text)
+    except (AttributeError, ValueError):
+        await query.message.reply_text("تعذر قراءة الإجراء.")
+        return
+    with db() as c:
+        row = c.execute("SELECT chat_id,asset,side,price,stop_distance FROM signals WHERE id=?", (signal_id,)).fetchone()
+    if not row or row[0] != query.message.chat_id:
+        await query.message.reply_text("هذه الإشارة غير متاحة لهذه المحادثة.")
+        return
+    if action == "reserve":
+        with db() as c:
+            c.execute("UPDATE signals SET profit_reserved=1,status='profit_plan' WHERE id=?", (signal_id,))
+        await query.message.reply_text("تم تسجيل خطة حجز الأرباح لهذه الإشارة. هذا إجراء تذكيري فقط، ولم تُرسل أي صفقة أو أمر.", reply_markup=management_keyboard(signal_id))
+    elif action == "alerts":
+        with db() as c:
+            current = c.execute("SELECT alerts_enabled FROM users WHERE chat_id=?", (query.message.chat_id,)).fetchone()
+            enabled = 0 if current and current[0] else 1
+            c.execute("UPDATE users SET alerts_enabled=? WHERE chat_id=?", (enabled, query.message.chat_id))
+        await query.message.reply_text("تم تفعيل التنبيهات الدورية." if enabled else "تم إيقاف التنبيهات الدورية.", reply_markup=management_keyboard(signal_id))
+    elif action == "rate":
+        await query.message.reply_text("اختر تقييم الإشارة من 1 إلى 5:", reply_markup=rating_keyboard(signal_id))
+    elif action == "refresh":
+        asset = row[1]
+        try:
+            fresh = await asyncio.to_thread(analyze, asset, YAHOO_SYMBOLS[asset])
+        except Exception as exc:
+            log.info("refresh failed for %s: %s", asset, exc)
+            fresh = None
+        if not fresh:
+            await query.message.reply_text(f"لا توجد قراءة مكتملة جديدة لـ {asset} أو أن البيانات غير متاحة/قديمة.")
+            return
+        new_id = save_signal(query.message.chat_id, fresh)
+        await query.message.reply_text(format_signal(fresh, None), reply_markup=signal_keyboard(new_id))
+
+
+async def rating_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("تم حفظ التقييم")
+    try:
+        _, signal_id_text, value_text = query.data.split(":", 2)
+        signal_id, value = int(signal_id_text), int(value_text)
+        if value not in range(1, 6):
+            raise ValueError
+    except (AttributeError, ValueError):
+        await query.message.reply_text("تقييم غير صالح.")
+        return
+    with db() as c:
+        row = c.execute("SELECT chat_id FROM signals WHERE id=?", (signal_id,)).fetchone()
+        if not row or row[0] != query.message.chat_id:
+            await query.message.reply_text("هذه الإشارة غير متاحة لهذه المحادثة.")
+            return
+        c.execute("UPDATE signals SET rating=? WHERE id=?", (value, signal_id))
+    await query.message.reply_text(f"تم حفظ تقييمك: {value}/5. سيظهر ضمن الذاكرة التراكمية.")
 
 async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"النطاق: {len(YAHOO_SYMBOLS)} رمزاً ديناميكياً (28 زوجاً رئيسياً/تقاطعيّاً، XAUUSD، XAGUSD، BTCUSD). قد يفشل بعض الرموز حسب تغطية Yahoo.")
+    await update.message.reply_text(f"النطاق: {len(YAHOO_SYMBOLS)} رمز MT5 قياسي (أزواج رئيسية وتقاطعّية، XAUUSD، XAGUSD، BTCUSD). مزود Yahoo للقراءة فقط وقد تختلف الأسعار عن وسيط MT5.")
 
 async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_chat.id)
     with db() as c:
         total, open_count = c.execute("SELECT COUNT(*), SUM(status='open') FROM signals WHERE chat_id=?", (update.effective_chat.id,)).fetchone()
         resolved = c.execute("SELECT COUNT(*), AVG(outcome) FROM signals WHERE chat_id=? AND status='resolved'", (update.effective_chat.id,)).fetchone()
-    await update.message.reply_text(f"الذاكرة الحية\nإشارات مسجلة: {total}\nمفتوحة: {open_count or 0}\nمغلقة بتقييم: {resolved[0]}\nمتوسط النتيجة المسجلة: {resolved[1] if resolved[1] is not None else 'لا توجد بيانات'}\nالتقييم التعلمي لا يضمن أداءً مستقبلياً.")
+        rated, avg_rating = c.execute("SELECT COUNT(rating), AVG(rating) FROM signals WHERE chat_id=?", (update.effective_chat.id,)).fetchone()
+        plans = c.execute("SELECT COUNT(*) FROM signals WHERE chat_id=? AND profit_reserved=1", (update.effective_chat.id,)).fetchone()[0]
+    await update.message.reply_text(f"الذاكرة الحية\nإشارات مسجلة: {total}\nمفتوحة: {open_count or 0}\nخطط حجز أرباح: {plans}\nإشارات مقيمة: {rated}\nمتوسط تقييم المستخدم: {avg_rating:.2f}/5\nمتوسط النتيجة المسجلة: {resolved[1] if resolved[1] is not None else 'لا توجد بيانات'}\nالتقييم التعلمي لا يضمن أداءً مستقبلياً.")
 
 async def set_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_chat.id)
@@ -247,7 +361,7 @@ async def set_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def periodic_scan(context: ContextTypes.DEFAULT_TYPE):
     signals = await asyncio.to_thread(scan_assets)
     if not signals: return
-    with db() as c: users = c.execute("SELECT chat_id,balance FROM users WHERE paused=0").fetchall()
+    with db() as c: users = c.execute("SELECT chat_id,balance FROM users WHERE paused=0 AND alerts_enabled=1").fetchall()
     for chat_id, balance in users:
         for sig in signals[:5]:
             signal_id = save_signal(chat_id, sig)
@@ -261,6 +375,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("help", help_cmd)); app.add_handler(CommandHandler("setbalance", setbalance)); app.add_handler(CommandHandler("scan", scan_cmd)); app.add_handler(CommandHandler("watchlist", watchlist)); app.add_handler(CommandHandler("performance", performance)); app.add_handler(CommandHandler("pause", set_pause)); app.add_handler(CommandHandler("resume", set_pause))
     app.add_handler(CallbackQueryHandler(targets_callback, pattern=r"^targets:\d+:(scalp|medium|long)$"))
+    app.add_handler(CallbackQueryHandler(rating_callback, pattern=r"^rating:\d+:[1-5]$"))
+    app.add_handler(CallbackQueryHandler(management_callback, pattern=r"^(reserve|alerts|rate|refresh):\d+$"))
     app.job_queue.run_repeating(periodic_scan, interval=INTERVAL_MIN*60, first=30)
     log.info("bot started; assets=%s interval=%sm timezone=%s", len(YAHOO_SYMBOLS), INTERVAL_MIN, TZ)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

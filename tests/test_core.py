@@ -7,6 +7,8 @@ import pandas as pd
 def test_asset_coverage():
     assert 'EURUSD' in bot.YAHOO_SYMBOLS
     assert 'EURJPY' in bot.YAHOO_SYMBOLS
+    assert 'USDCAD' in bot.YAHOO_SYMBOLS
+    assert 'CADUSD' not in bot.YAHOO_SYMBOLS
     assert bot.YAHOO_SYMBOLS['XAUUSD'] == 'XAUUSD=X'
     assert bot.YAHOO_SYMBOLS['BTCUSD'] == 'BTC-USD'
 
@@ -31,4 +33,8 @@ def test_dynamic_targets_scale_by_style_and_direction():
 def test_keyboard_contains_all_trade_styles():
     keyboard = bot.signal_keyboard(42).inline_keyboard
     callback_data = [button.callback_data for row in keyboard for button in row]
-    assert callback_data == ['targets:42:scalp', 'targets:42:medium', 'targets:42:long']
+    assert callback_data[:3] == ['targets:42:scalp', 'targets:42:medium', 'targets:42:long']
+    assert 'refresh:42' in callback_data
+    assert 'alerts:42' in callback_data
+    assert 'reserve:42' in callback_data
+    assert 'rate:42' in callback_data
