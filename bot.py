@@ -34,11 +34,11 @@ NEWS_EVENTS_FILE = ROOT / os.getenv("NEWS_EVENTS_FILE", "data/news_events.json")
 NEWS_EVENTS_URL = os.getenv("NEWS_EVENTS_URL", "").strip()
 NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
-PRICE_PROVIDER = os.getenv("PRICE_PROVIDER", "broker_http").lower()
+PRICE_PROVIDER = os.getenv("PRICE_PROVIDER", "yahoo").lower()
 BROKER_FEED_URL = os.getenv("BROKER_FEED_URL", "").strip()
 BROKER_FEED_TOKEN = os.getenv("BROKER_FEED_TOKEN", "").strip()
 BROKER_FEED_TIMEOUT = int(os.getenv("BROKER_FEED_TIMEOUT_SECONDS", "8"))
-ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "0").lower() in {"1", "true", "yes"}
+ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "1").lower() in {"1", "true", "yes"}
 DB_PATH = ROOT / "data" / "bot.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,7 +53,15 @@ MT5_SYMBOLS = [
     "AUDNZD", "AUDCAD", "AUDCHF", "AUDJPY", "NZDCAD", "NZDCHF", "NZDJPY",
     "CADCHF", "CADJPY", "CHFJPY", "XAUUSD", "XAGUSD", "BTCUSD",
 ]
-YAHOO_SYMBOLS = {symbol: ("BTC-USD" if symbol == "BTCUSD" else f"{symbol}=X") for symbol in MT5_SYMBOLS}
+YAHOO_SYMBOLS = {
+    symbol: (
+        "BTC-USD" if symbol == "BTCUSD" else
+        "GC=F" if symbol == "XAUUSD" else
+        "SI=F" if symbol == "XAGUSD" else
+        f"{symbol}=X"
+    )
+    for symbol in MT5_SYMBOLS
+}
 
 @dataclass
 class Signal:
@@ -241,9 +249,9 @@ def fetch_live(symbol: str) -> tuple[pd.DataFrame, str]:
 
 
 def fetch(symbol: str) -> tuple[pd.DataFrame, str]:
-    if PRICE_PROVIDER in {"broker_http", "mt5_bridge", "broker"}:
+    if PRICE_PROVIDER in {"broker_http", "mt5_bridge", "broker"} and BROKER_FEED_URL:
         return fetch_live(symbol)
-    if PRICE_PROVIDER != "yahoo" or not ALLOW_PUBLIC_FALLBACK:
+    if PRICE_PROVIDER != "yahoo" and not ALLOW_PUBLIC_FALLBACK:
         raise RuntimeError("no approved live broker feed configured")
     data = yf.download(symbol, period=YF_PERIOD, interval=YF_INTERVAL, auto_adjust=False, progress=False, threads=False)
     if data is None or data.empty:
@@ -260,6 +268,7 @@ def fetch(symbol: str) -> tuple[pd.DataFrame, str]:
     age = datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
     if age > timedelta(minutes=MAX_AGE_MIN):
         raise ValueError(f"stale_data:{int(age.total_seconds()/60)}m")
+    data.attrs["source"] = "Yahoo Finance public/reference feed"
     return data, observed.isoformat()
 
 

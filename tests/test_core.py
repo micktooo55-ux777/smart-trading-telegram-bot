@@ -10,7 +10,8 @@ def test_asset_coverage():
     assert 'EURJPY' in bot.YAHOO_SYMBOLS
     assert 'USDCAD' in bot.YAHOO_SYMBOLS
     assert 'CADUSD' not in bot.YAHOO_SYMBOLS
-    assert bot.YAHOO_SYMBOLS['XAUUSD'] == 'XAUUSD=X'
+    assert bot.YAHOO_SYMBOLS['XAUUSD'] == 'GC=F'
+    assert bot.YAHOO_SYMBOLS['XAGUSD'] == 'SI=F'
     assert bot.YAHOO_SYMBOLS['BTCUSD'] == 'BTC-USD'
 
 def test_rsi_range():
