@@ -1,0 +1,32 @@
+# Smart Trading Telegram Bot
+
+بوت Telegram للتحليل الفني والتنبيهات فقط، يعمل على Termux. لا ينفذ أوامر تداول ولا يتصل بوسيط للكتابة.
+
+## الوظائف
+
+- RSI وPrice Action Engulfing مع فلتر اتجاه اختياري.
+- مخاطرة نموذجية 1%: يحسب المسافة المقترحة للوقف وحجم الصفقة النظري فقط؛ لا يرسل أمرًا.
+- مسح أزواج العملات الرئيسية والتقاطعية، الذهب والفضة وBitcoin عبر رموز Yahoo Finance.
+- سجل SQLite للإشارات، نتائجها اللاحقة، وتقرير أداء تراكمي.
+- رفض البيانات الفارغة أو القديمة، وتسجيل مصدر ووقت كل قراءة.
+- تشغيل مستمر على Termux باستخدام tmux.
+
+## حدود مهمة
+
+بيانات Yahoo Finance قد تكون متأخرة أو غير متاحة لبعض رموز الفوركس/المعادن. البوت يذكر ذلك في الرسائل ولا يحولها إلى أسعار تنفيذية. التنبيهات ليست توصية استثمارية ولا تضمن الربح.
+
+## التشغيل السريع على Termux
+
+```bash
+pkg update && pkg install python tmux git -y
+bash install_termux.sh
+cp .env.example .env
+nano .env
+bash run_tmux.sh
+```
+
+ضع `TELEGRAM_BOT_TOKEN` في `.env` فقط، ولا ترفع الملف إلى GitHub. راجع السجل عبر `tmux attach -t smart-trading-bot`.
+
+## أوامر Telegram
+
+`/start`، `/setbalance 1000`، `/scan`، `/watchlist`، `/performance`، `/pause`، `/resume`، `/help`.
