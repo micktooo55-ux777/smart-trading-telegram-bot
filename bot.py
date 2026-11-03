@@ -1,8 +1,10 @@
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import os
 import sqlite3
+from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +29,11 @@ EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 CONTRACT_UNITS_PER_LOT = float(os.getenv("CONTRACT_UNITS_PER_LOT", "100000"))
 PRICE_VALUE_PER_UNIT = float(os.getenv("PRICE_VALUE_PER_UNIT", "1.0"))
+NEWS_FILTER_REQUIRED = os.getenv("NEWS_FILTER_REQUIRED", "1").lower() in {"1", "true", "yes"}
+NEWS_EVENTS_FILE = ROOT / os.getenv("NEWS_EVENTS_FILE", "data/news_events.json")
+NEWS_EVENTS_URL = os.getenv("NEWS_EVENTS_URL", "").strip()
+NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
+DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
 DB_PATH = ROOT / "data" / "bot.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -54,6 +61,9 @@ class Signal:
     confidence: str
     observed_at: str
     source: str = "Yahoo Finance delayed/read-only"
+    dxy_bias: str = "unknown"
+    correlation_note: str = ""
+    news_note: str = ""
 
 
 TRADE_STYLES = {
@@ -78,6 +88,9 @@ def db():
         "rating": "INTEGER",
         "profit_reserved": "INTEGER DEFAULT 0",
         "last_refresh": "TEXT",
+        "dxy_bias": "TEXT",
+        "correlation_note": "TEXT",
+        "news_note": "TEXT",
     })
     return conn
 
@@ -98,11 +111,73 @@ def ensure_user(chat_id: int):
         c.execute("INSERT OR IGNORE INTO users(chat_id, balance, created_at) VALUES (?, NULL, ?)", (chat_id, now_iso()))
 
 
+def _load_news_events() -> list[dict]:
+    """Load a normalized economic-calendar JSON list; never invent missing events."""
+    try:
+        if NEWS_EVENTS_URL:
+            request = Request(NEWS_EVENTS_URL, headers={"User-Agent": "smart-trading-telegram-bot/1.0"})
+            with urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        elif NEWS_EVENTS_FILE.exists():
+            payload = json.loads(NEWS_EVENTS_FILE.read_text(encoding="utf-8"))
+        else:
+            return []
+        events = payload.get("events", payload) if isinstance(payload, dict) else payload
+        return [event for event in events if isinstance(event, dict)]
+    except Exception as exc:
+        log.warning("news calendar unavailable: %s", exc)
+        return []
+
+
+def news_guard(asset: str, at: Optional[datetime] = None) -> tuple[bool, str]:
+    """Return (allowed, note). Missing data blocks when NEWS_FILTER_REQUIRED is enabled."""
+    events = _load_news_events()
+    if not events:
+        return (not NEWS_FILTER_REQUIRED, "لا يوجد تقويم أخبار موثوق متاح")
+    at = at or datetime.now(timezone.utc)
+    for event in events:
+        try:
+            impact = str(event.get("impact", "")).lower()
+            event_time = datetime.fromisoformat(str(event["time"]).replace("Z", "+00:00"))
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=timezone.utc)
+            currencies = {str(x).upper() for x in event.get("currencies", [])}
+            asset_currencies = {asset[:3], asset[3:6]} if len(asset) >= 6 else set()
+            relevant = not currencies or bool(currencies & asset_currencies) or "USD" in currencies
+            within = abs((event_time - at).total_seconds()) <= NEWS_BLACKOUT_MIN * 60
+            if impact in {"high", "critical", "3"} and relevant and within:
+                return False, f"حظر أخبار {event.get('title', 'عالي التأثير')} حتى {event_time.isoformat()}"
+        except (KeyError, TypeError, ValueError):
+            continue
+    return True, "لا يوجد إصدار عالي التأثير ضمن نافذة الحظر"
+
+
+def dxy_guard(asset: str, side: str, dxy_data: Optional[pd.DataFrame]) -> tuple[bool, str, str]:
+    """Confirm USD-correlated assets against DXY EMA direction."""
+    if dxy_data is None or dxy_data.empty:
+        return False, "unknown", "بيانات DXY غير متاحة؛ تم حظر الإشارة"
+    close = dxy_data["Close"].astype(float)
+    fast = float(close.ewm(span=EMA_FAST, adjust=False).mean().iloc[-1])
+    slow = float(close.ewm(span=EMA_SLOW, adjust=False).mean().iloc[-1])
+    dxy_bias = "down" if fast < slow else "up" if fast > slow else "flat"
+    if asset in {"XAUUSD", "XAGUSD"}:
+        allowed = (side == "BUY" and dxy_bias == "down") or (side == "SELL" and dxy_bias == "up")
+        return allowed, dxy_bias, f"DXY={dxy_bias}; {asset} يتطلب ارتباطاً عكسياً مؤكداً"
+    if asset.startswith("USD"):
+        expected = "up" if side == "BUY" else "down"
+    elif asset.endswith("USD"):
+        expected = "down" if side == "BUY" else "up"
+    else:
+        expected = None
+    allowed = expected is None or dxy_bias == expected
+    return allowed, dxy_bias, f"DXY={dxy_bias}; التوقع={expected or 'غير مباشر'}"
+
+
 def save_signal(chat_id: int, sig: Signal) -> int:
     with db() as c:
         cur = c.execute(
-            "INSERT INTO signals(chat_id,asset,side,price,rsi,pattern,stop_distance,risk_pct,observed_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (chat_id, sig.asset, sig.side, sig.price, sig.rsi, sig.pattern, sig.stop_distance, RISK_PCT, sig.observed_at),
+            "INSERT INTO signals(chat_id,asset,side,price,rsi,pattern,stop_distance,risk_pct,observed_at,dxy_bias,correlation_note,news_note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, sig.asset, sig.side, sig.price, sig.rsi, sig.pattern, sig.stop_distance, RISK_PCT, sig.observed_at, sig.dxy_bias, sig.correlation_note, sig.news_note),
         )
         return int(cur.lastrowid)
 
@@ -135,7 +210,7 @@ def fetch(symbol: str) -> tuple[pd.DataFrame, str]:
     return data, observed.isoformat()
 
 
-def analyze(asset: str, symbol: str) -> Signal | None:
+def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) -> Signal | None:
     data, observed = fetch(symbol)
     close = data["Close"].astype(float)
     data["rsi"] = rsi(close)
@@ -158,10 +233,19 @@ def analyze(asset: str, symbol: str) -> Signal | None:
         side, pattern = "SELL", "Bearish Engulfing"
     if not side:
         return None
+    news_allowed, news_note = news_guard(asset)
+    if not news_allowed:
+        log.info("%s blocked by news guard: %s", asset, news_note)
+        return None
+    correlation_allowed, dxy_bias, correlation_note = dxy_guard(asset, side, dxy_data)
+    if not correlation_allowed:
+        log.info("%s blocked by DXY guard: %s", asset, correlation_note)
+        return None
     price = float(last.Close)
     candle_range = max(float(last.High - last.Low), price * 0.001)
     confidence = "high" if (current_rsi <= 40 or current_rsi >= 60) else "medium"
-    return Signal(asset, side, price, current_rsi, pattern, candle_range, confidence, observed)
+    return Signal(asset, side, price, current_rsi, pattern, candle_range, confidence, observed,
+                  dxy_bias=dxy_bias, correlation_note=correlation_note, news_note=news_note)
 
 
 def signal_keyboard(signal_id: int) -> InlineKeyboardMarkup:
@@ -171,6 +255,7 @@ def signal_keyboard(signal_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(TRADE_STYLES["long"]["label"], callback_data=f"targets:{signal_id}:long")],
         [InlineKeyboardButton("🔄 تحديث التحليل", callback_data=f"refresh:{signal_id}"), InlineKeyboardButton("🔔 التنبيهات", callback_data=f"alerts:{signal_id}")],
         [InlineKeyboardButton("💰 حجز الأرباح (خطة)", callback_data=f"reserve:{signal_id}")],
+        [InlineKeyboardButton("🛡️ الارتباط والأخبار", callback_data=f"context:{signal_id}")],
         [InlineKeyboardButton("⭐ قيّم الإشارة", callback_data=f"rate:{signal_id}")],
     ])
 
@@ -185,6 +270,7 @@ def management_keyboard(signal_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 تحديث التحليل", callback_data=f"refresh:{signal_id}"), InlineKeyboardButton("🔔 التنبيهات", callback_data=f"alerts:{signal_id}")],
         [InlineKeyboardButton("💰 حجز الأرباح (خطة)", callback_data=f"reserve:{signal_id}"), InlineKeyboardButton("⭐ تقييم", callback_data=f"rate:{signal_id}")],
+        [InlineKeyboardButton("🛡️ الارتباط والأخبار", callback_data=f"context:{signal_id}")],
     ])
 
 
@@ -196,7 +282,7 @@ def format_signal(sig: Signal, balance: Optional[float]) -> str:
     return (f"فرصة تحليلية جديدة — {sig.asset}\n الاتجاه: {sig.side}\n السعر المرجعي: {sig.price:.6g}\n"
             f"RSI: {sig.rsi:.2f} | النموذج: {sig.pattern}\nوقف نموذجي: {sig.stop_distance:.6g}\n"
             f"مخاطرة النموذج: {RISK_PCT:.2f}% | {sizing}\n"
-            f"الثقة: {sig.confidence}\nوقت القراءة UTC: {sig.observed_at}\nالمصدر: {sig.source}\n"
+            f"الثقة: {sig.confidence}\nDXY: {sig.dxy_bias}\nوقت القراءة UTC: {sig.observed_at}\nالمصدر: {sig.source}\n"
             "اختر نوع الصفقة لحساب SL وTP1 وTP2 وTP3 ديناميكياً:\n"
             "تنبيه: الأسعار مرجعية وليست MT5 تنفيذية؛ تحقق من السعر والسبريد بنفسك.")
 
@@ -220,9 +306,14 @@ def format_targets(asset: str, side: str, entry: float, candle_range: float, sty
 
 def scan_assets() -> list[Signal]:
     out = []
+    try:
+        dxy_data, _ = fetch(DXY_SYMBOL)
+    except Exception as exc:
+        log.warning("DXY shield unavailable; scan blocked: %s", exc)
+        return out
     for asset, symbol in YAHOO_SYMBOLS.items():
         try:
-            sig = analyze(asset, symbol)
+            sig = analyze(asset, symbol, dxy_data)
             if sig:
                 out.append(sig)
         except Exception as e:
@@ -295,7 +386,15 @@ async def management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not row or row[0] != query.message.chat_id:
         await query.message.reply_text("هذه الإشارة غير متاحة لهذه المحادثة.")
         return
-    if action == "reserve":
+    if action == "context":
+        with db() as c:
+            context_row = c.execute("SELECT dxy_bias,correlation_note,news_note FROM signals WHERE id=?", (signal_id,)).fetchone()
+        dxy_bias, correlation_note, news_note = context_row or ("unknown", "غير متاح", "غير متاح")
+        await query.message.reply_text(
+            f"درع السوق — {row[1]}\nDXY: {dxy_bias or 'unknown'}\nالارتباط: {correlation_note or 'غير متاح'}\nالأخبار: {news_note or 'غير متاح'}\n\nهذه قراءة مرجعية وليست ضماناً ضد الانعكاس.",
+            reply_markup=management_keyboard(signal_id),
+        )
+    elif action == "reserve":
         with db() as c:
             c.execute("UPDATE signals SET profit_reserved=1,status='profit_plan' WHERE id=?", (signal_id,))
         await query.message.reply_text("تم تسجيل خطة حجز الأرباح لهذه الإشارة. هذا إجراء تذكيري فقط، ولم تُرسل أي صفقة أو أمر.", reply_markup=management_keyboard(signal_id))
@@ -310,7 +409,8 @@ async def management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "refresh":
         asset = row[1]
         try:
-            fresh = await asyncio.to_thread(analyze, asset, YAHOO_SYMBOLS[asset])
+            dxy_data, _ = await asyncio.to_thread(fetch, DXY_SYMBOL)
+            fresh = await asyncio.to_thread(analyze, asset, YAHOO_SYMBOLS[asset], dxy_data)
         except Exception as exc:
             log.info("refresh failed for %s: %s", asset, exc)
             fresh = None
@@ -376,7 +476,7 @@ def main():
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("help", help_cmd)); app.add_handler(CommandHandler("setbalance", setbalance)); app.add_handler(CommandHandler("scan", scan_cmd)); app.add_handler(CommandHandler("watchlist", watchlist)); app.add_handler(CommandHandler("performance", performance)); app.add_handler(CommandHandler("pause", set_pause)); app.add_handler(CommandHandler("resume", set_pause))
     app.add_handler(CallbackQueryHandler(targets_callback, pattern=r"^targets:\d+:(scalp|medium|long)$"))
     app.add_handler(CallbackQueryHandler(rating_callback, pattern=r"^rating:\d+:[1-5]$"))
-    app.add_handler(CallbackQueryHandler(management_callback, pattern=r"^(reserve|alerts|rate|refresh):\d+$"))
+    app.add_handler(CallbackQueryHandler(management_callback, pattern=r"^(reserve|alerts|rate|refresh|context):\d+$"))
     app.job_queue.run_repeating(periodic_scan, interval=INTERVAL_MIN*60, first=30)
     log.info("bot started; assets=%s interval=%sm timezone=%s", len(YAHOO_SYMBOLS), INTERVAL_MIN, TZ)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

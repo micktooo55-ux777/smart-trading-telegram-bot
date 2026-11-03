@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'test-token')
 import bot
 import pandas as pd
+from datetime import datetime, timezone
 
 def test_asset_coverage():
     assert 'EURUSD' in bot.YAHOO_SYMBOLS
@@ -38,3 +39,18 @@ def test_keyboard_contains_all_trade_styles():
     assert 'alerts:42' in callback_data
     assert 'reserve:42' in callback_data
     assert 'rate:42' in callback_data
+    assert 'context:42' in callback_data
+
+def test_dxy_guard_blocks_gold_when_bias_conflicts():
+    dxy = pd.DataFrame({'Close': [100.0] * 40 + [101.0] * 10})
+    allowed, bias, note = bot.dxy_guard('XAUUSD', 'BUY', dxy)
+    assert bias == 'up'
+    assert allowed is False
+    assert 'DXY=up' in note
+
+def test_news_guard_fails_closed_without_calendar(monkeypatch):
+    monkeypatch.setattr(bot, 'NEWS_FILTER_REQUIRED', True)
+    monkeypatch.setattr(bot, '_load_news_events', lambda: [])
+    allowed, note = bot.news_guard('EURUSD', datetime.now(timezone.utc))
+    assert allowed is False
+    assert 'تقويم أخبار' in note
