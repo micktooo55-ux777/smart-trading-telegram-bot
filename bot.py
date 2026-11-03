@@ -34,6 +34,11 @@ NEWS_EVENTS_FILE = ROOT / os.getenv("NEWS_EVENTS_FILE", "data/news_events.json")
 NEWS_EVENTS_URL = os.getenv("NEWS_EVENTS_URL", "").strip()
 NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
+PRICE_PROVIDER = os.getenv("PRICE_PROVIDER", "broker_http").lower()
+BROKER_FEED_URL = os.getenv("BROKER_FEED_URL", "").strip()
+BROKER_FEED_TOKEN = os.getenv("BROKER_FEED_TOKEN", "").strip()
+BROKER_FEED_TIMEOUT = int(os.getenv("BROKER_FEED_TIMEOUT_SECONDS", "8"))
+ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "0").lower() in {"1", "true", "yes"}
 DB_PATH = ROOT / "data" / "bot.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -60,7 +65,7 @@ class Signal:
     stop_distance: float
     confidence: str
     observed_at: str
-    source: str = "Yahoo Finance delayed/read-only"
+    source: str = "broker_live_feed"
     dxy_bias: str = "unknown"
     correlation_note: str = ""
     news_note: str = ""
@@ -191,7 +196,55 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def _normalize_live_payload(symbol: str, payload: dict) -> tuple[pd.DataFrame, str]:
+    """Validate the broker bridge contract before indicators use the candles."""
+    if str(payload.get("symbol", symbol)).upper() != symbol.upper():
+        raise ValueError("live_symbol_mismatch")
+    candles = payload.get("candles")
+    if not isinstance(candles, list) or len(candles) < 30:
+        raise ValueError("live_insufficient_candles")
+    frame = pd.DataFrame(candles)
+    required = {"time", "open", "high", "low", "close"}
+    if not required.issubset(frame.columns):
+        raise ValueError("live_schema_missing")
+    frame = frame.rename(columns={"time": "Time", "open": "Open", "high": "High", "low": "Low", "close": "Close"})
+    for column in ["Open", "High", "Low", "Close"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+    if len(frame) < 30:
+        raise ValueError("live_insufficient_valid_candles")
+    observed = pd.Timestamp(frame["Time"].iloc[-1]).to_pydatetime()
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
+    if age > timedelta(minutes=MAX_AGE_MIN):
+        raise ValueError(f"live_stale_data:{int(age.total_seconds()/60)}m")
+    frame = frame.set_index("Time")
+    frame.attrs["bid"] = payload.get("bid")
+    frame.attrs["ask"] = payload.get("ask")
+    frame.attrs["source"] = payload.get("source", "broker_live_feed")
+    return frame, observed.isoformat()
+
+
+def fetch_live(symbol: str) -> tuple[pd.DataFrame, str]:
+    if not BROKER_FEED_URL:
+        raise RuntimeError("BROKER_FEED_URL is not configured; refusing public-price fallback")
+    separator = "&" if "?" in BROKER_FEED_URL else "?"
+    url = f"{BROKER_FEED_URL}{separator}symbol={symbol}&interval={YF_INTERVAL}&period={YF_PERIOD}"
+    headers = {"User-Agent": "smart-trading-telegram-bot/1.0", "Accept": "application/json"}
+    if BROKER_FEED_TOKEN:
+        headers["Authorization"] = f"Bearer {BROKER_FEED_TOKEN}"
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=BROKER_FEED_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return _normalize_live_payload(symbol, payload)
+
+
 def fetch(symbol: str) -> tuple[pd.DataFrame, str]:
+    if PRICE_PROVIDER in {"broker_http", "mt5_bridge", "broker"}:
+        return fetch_live(symbol)
+    if PRICE_PROVIDER != "yahoo" or not ALLOW_PUBLIC_FALLBACK:
+        raise RuntimeError("no approved live broker feed configured")
     data = yf.download(symbol, period=YF_PERIOD, interval=YF_INTERVAL, auto_adjust=False, progress=False, threads=False)
     if data is None or data.empty:
         raise ValueError("no_data")
@@ -241,10 +294,19 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
     if not correlation_allowed:
         log.info("%s blocked by DXY guard: %s", asset, correlation_note)
         return None
-    price = float(last.Close)
+    live_bid = pd.to_numeric(data.attrs.get("bid"), errors="coerce")
+    live_ask = pd.to_numeric(data.attrs.get("ask"), errors="coerce")
+    if side == "BUY" and pd.notna(live_ask):
+        price = float(live_ask)
+    elif side == "SELL" and pd.notna(live_bid):
+        price = float(live_bid)
+    else:
+        price = float(last.Close)
     candle_range = max(float(last.High - last.Low), price * 0.001)
     confidence = "high" if (current_rsi <= 40 or current_rsi >= 60) else "medium"
+    source = str(data.attrs.get("source", "Yahoo Finance delayed/read-only"))
     return Signal(asset, side, price, current_rsi, pattern, candle_range, confidence, observed,
+                  source=source,
                   dxy_bias=dxy_bias, correlation_note=correlation_note, news_note=news_note)
 
 

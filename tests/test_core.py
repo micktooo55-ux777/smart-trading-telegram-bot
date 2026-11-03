@@ -54,3 +54,16 @@ def test_news_guard_fails_closed_without_calendar(monkeypatch):
     allowed, note = bot.news_guard('EURUSD', datetime.now(timezone.utc))
     assert allowed is False
     assert 'تقويم أخبار' in note
+
+def test_live_feed_contract_validates_candles_and_quotes():
+    candles = [
+        {'time': f'2026-11-03T20:{i:02d}:00Z', 'open': 1.0, 'high': 1.01, 'low': 0.99, 'close': 1.0 + i / 10000}
+        for i in range(30)
+    ]
+    frame, observed = bot._normalize_live_payload('EURUSD', {
+        'symbol': 'EURUSD', 'source': 'test-broker', 'bid': 1.1010, 'ask': 1.1012, 'candles': candles
+    })
+    assert len(frame) == 30
+    assert frame.attrs['bid'] == 1.1010
+    assert frame.attrs['ask'] == 1.1012
+    assert observed.endswith('+00:00')
