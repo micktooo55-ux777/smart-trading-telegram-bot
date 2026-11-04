@@ -68,3 +68,15 @@ def test_live_feed_contract_validates_candles_and_quotes():
     assert frame.attrs['bid'] == 1.1010
     assert frame.attrs['ask'] == 1.1012
     assert observed.endswith('+00:00')
+
+def test_learning_settles_tp3_and_updates_weight(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, 'DB_PATH', tmp_path / 'learning.db')
+    with bot.db() as c:
+        c.execute("INSERT INTO signals(chat_id,asset,side,price,stop_distance,risk_pct,observed_at,feature_vector,status) VALUES(?,?,?,?,?,?,?,?,?)", (1, 'EURUSD', 'BUY', 1.0, 0.1, 1.0, bot.now_iso(), '{"pattern": 1.0}', 'open'))
+    assert bot.settle_open_signals({'EURUSD': 1.46}) == 1
+    with bot.db() as c:
+        row = c.execute("SELECT status,outcome_stage,outcome_label,outcome_r FROM signals WHERE chat_id=1").fetchone()
+        weight = c.execute("SELECT weight,samples FROM filter_weights WHERE name='pattern'").fetchone()
+    assert row == ('resolved', 'TP3', 'win', 4.5)
+    assert weight[1] == 1
+    assert weight[0] > 1.0

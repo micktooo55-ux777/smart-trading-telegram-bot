@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sqlite3
+from dataclasses import field
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,11 @@ ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "1").lower() in {"1",
 DB_PATH = ROOT / "data" / "bot.db"
 SIGNATURE = "> Built by Eng. Nafea Abdulrahman Al-Karandi"
 MAX_CONCURRENT_FETCHES = max(1, int(os.getenv("MAX_CONCURRENT_FETCHES", "6")))
+LEARNING_RATE = float(os.getenv("LEARNING_RATE", "0.05"))
+LEARNING_MIN_SCORE = float(os.getenv("LEARNING_MIN_SCORE", "0.55"))
+LEARNING_MIN_SAMPLES = int(os.getenv("LEARNING_MIN_SAMPLES", "20"))
+LEARNING_MAX_WEIGHT = float(os.getenv("LEARNING_MAX_WEIGHT", "2.0"))
+LEARNING_MIN_WEIGHT = float(os.getenv("LEARNING_MIN_WEIGHT", "0.25"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smart-bot")
@@ -81,6 +87,8 @@ class Signal:
     dxy_bias: str = "unknown"
     correlation_note: str = ""
     news_note: str = ""
+    feature_vector: dict[str, float] = field(default_factory=dict)
+    learning_score: float = 0.0
 
 
 TRADE_STYLES = {
@@ -97,6 +105,7 @@ def db():
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS users(chat_id INTEGER PRIMARY KEY, balance REAL, paused INTEGER DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY, chat_id INTEGER, asset TEXT, side TEXT, price REAL, rsi REAL, pattern TEXT, stop_distance REAL, risk_pct REAL, observed_at TEXT, status TEXT DEFAULT 'open', outcome REAL, checked_at TEXT);
+    CREATE TABLE IF NOT EXISTS filter_weights(name TEXT PRIMARY KEY, weight REAL NOT NULL, samples INTEGER DEFAULT 0, updated_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_signals_user ON signals(chat_id, observed_at);
     """)
     _add_columns(conn, "users", {"alerts_enabled": "INTEGER DEFAULT 1"})
@@ -108,7 +117,19 @@ def db():
         "dxy_bias": "TEXT",
         "correlation_note": "TEXT",
         "news_note": "TEXT",
+        "feature_vector": "TEXT",
+        "learning_score": "REAL",
+        "outcome_r": "REAL",
+        "outcome_label": "TEXT",
+        "resolved_at": "TEXT",
+        "last_price": "REAL",
+        "outcome_stage": "TEXT",
+        "tp1_at": "TEXT",
+        "tp2_at": "TEXT",
+        "tp3_at": "TEXT",
     })
+    for name in ("trend", "rsi", "pattern", "dxy", "news", "bollinger", "liquidity"):
+        conn.execute("INSERT OR IGNORE INTO filter_weights(name, weight, samples, updated_at) VALUES (?, 1.0, 0, ?)", (name, now_iso()))
     return conn
 
 
@@ -126,6 +147,84 @@ def now_iso() -> str:
 def ensure_user(chat_id: int):
     with db() as c:
         c.execute("INSERT OR IGNORE INTO users(chat_id, balance, created_at) VALUES (?, NULL, ?)", (chat_id, now_iso()))
+
+
+def load_weights() -> dict[str, float]:
+    with db() as c:
+        return {name: float(weight) for name, weight in c.execute("SELECT name,weight FROM filter_weights")}
+
+
+def weighted_filter_score(features: dict[str, float]) -> float:
+    weights = load_weights()
+    total = sum(weights.get(name, 1.0) for name in features)
+    return sum(weights.get(name, 1.0) * float(value) for name, value in features.items()) / total if total else 0.0
+
+
+def learned_acceptance_threshold() -> float:
+    with db() as c:
+        wins, losses = c.execute("SELECT SUM(outcome_label='win'), SUM(outcome_label='loss') FROM signals WHERE outcome_label IS NOT NULL").fetchone()
+    samples = (wins or 0) + (losses or 0)
+    if samples < LEARNING_MIN_SAMPLES:
+        return LEARNING_MIN_SCORE
+    win_rate = (wins or 0) / samples
+    return min(0.75, max(LEARNING_MIN_SCORE, 0.65 if win_rate < 0.45 else 0.55))
+
+
+def update_filter_weights(feature_vector: dict[str, float], outcome_r: float) -> None:
+    """Bounded online update; outcome is hypothetical R, never an executed fill."""
+    direction = 1.0 if outcome_r > 0 else -1.0
+    with db() as c:
+        for name, value in feature_vector.items():
+            row = c.execute("SELECT weight,samples FROM filter_weights WHERE name=?", (name,)).fetchone()
+            if not row:
+                continue
+            old_weight, samples = float(row[0]), int(row[1])
+            new_weight = old_weight + LEARNING_RATE * direction * float(value)
+            new_weight = max(LEARNING_MIN_WEIGHT, min(LEARNING_MAX_WEIGHT, new_weight))
+            c.execute("UPDATE filter_weights SET weight=?,samples=?,updated_at=? WHERE name=?", (new_weight, samples + 1, now_iso(), name))
+
+
+def settle_open_signals(prices: dict[str, float]) -> int:
+    """Track hypothetical SL/TP milestones and learn only from final outcomes."""
+    resolved = []
+    with db() as c:
+        rows = c.execute("SELECT id,asset,side,price,stop_distance,feature_vector,status FROM signals WHERE status IN ('open','tp1','tp2')").fetchall()
+        missing_assets = {row[1] for row in rows if row[1] not in prices}
+    for asset in missing_assets:
+        try:
+            frame, _ = fetch(YAHOO_SYMBOLS[asset])
+            prices[asset] = float(frame["Close"].iloc[-1])
+        except Exception:
+            continue
+    with db() as c:
+        rows = c.execute("SELECT id,asset,side,price,stop_distance,feature_vector,status FROM signals WHERE status IN ('open','tp1','tp2')").fetchall()
+        for signal_id, asset, side, entry, stop_distance, vector_json, status in rows:
+            current = prices.get(asset)
+            if current is None or not stop_distance:
+                continue
+            move = (float(current) - float(entry)) if side == "BUY" else (float(entry) - float(current))
+            outcome_r = move / float(stop_distance)
+            if outcome_r <= -1.0:
+                c.execute("UPDATE signals SET status='resolved',outcome_stage='SL',outcome_r=-1.0,outcome_label='loss',outcome=-1.0,last_price=?,checked_at=?,resolved_at=? WHERE id=?", (float(current), now_iso(), now_iso(), signal_id))
+                try:
+                    resolved.append((json.loads(vector_json or "{}"), -1.0))
+                except json.JSONDecodeError:
+                    pass
+            elif outcome_r >= 4.5:
+                c.execute("UPDATE signals SET status='resolved',outcome_stage='TP3',outcome_r=4.5,outcome_label='win',outcome=4.5,last_price=?,checked_at=?,resolved_at=?,tp3_at=? WHERE id=?", (float(current), now_iso(), now_iso(), now_iso(), signal_id))
+                try:
+                    resolved.append((json.loads(vector_json or "{}"), 4.5))
+                except json.JSONDecodeError:
+                    pass
+            elif outcome_r >= 2.8:
+                c.execute("UPDATE signals SET status='tp2',outcome_stage='TP2',outcome_r=2.8,last_price=?,checked_at=?,tp2_at=COALESCE(tp2_at,?) WHERE id=?", (float(current), now_iso(), now_iso(), signal_id))
+            elif outcome_r >= 1.5:
+                c.execute("UPDATE signals SET status='tp1',outcome_stage='TP1',outcome_r=1.5,last_price=?,checked_at=?,tp1_at=COALESCE(tp1_at,?) WHERE id=?", (float(current), now_iso(), now_iso(), signal_id))
+            else:
+                c.execute("UPDATE signals SET last_price=?,checked_at=? WHERE id=?", (float(current), now_iso(), signal_id))
+    for vector, outcome_r in resolved:
+        update_filter_weights(vector, outcome_r)
+    return len(resolved)
 
 
 def _load_news_events() -> list[dict]:
@@ -195,8 +294,8 @@ def dxy_guard(asset: str, side: str, dxy_data: Optional[pd.DataFrame]) -> tuple[
 def save_signal(chat_id: int, sig: Signal) -> int:
     with db() as c:
         cur = c.execute(
-            "INSERT INTO signals(chat_id,asset,side,price,rsi,pattern,stop_distance,risk_pct,observed_at,dxy_bias,correlation_note,news_note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (chat_id, sig.asset, sig.side, sig.price, sig.rsi, sig.pattern, sig.stop_distance, RISK_PCT, sig.observed_at, sig.dxy_bias, sig.correlation_note, sig.news_note),
+            "INSERT INTO signals(chat_id,asset,side,price,rsi,pattern,stop_distance,risk_pct,observed_at,dxy_bias,correlation_note,news_note,feature_vector,learning_score) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, sig.asset, sig.side, sig.price, sig.rsi, sig.pattern, sig.stop_distance, RISK_PCT, sig.observed_at, sig.dxy_bias, sig.correlation_note, sig.news_note, json.dumps(sig.feature_vector), sig.learning_score),
         )
         return int(cur.lastrowid)
 
@@ -345,6 +444,21 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
     if not correlation_allowed:
         log.info("%s blocked by DXY guard: %s", asset, correlation_note)
         return None
+    feature_vector = {
+        "trend": 1.0 if ((side == "BUY" and bullish_trend) or (side == "SELL" and bearish_trend)) else 0.0,
+        "rsi": 1.0 if ((side == "BUY" and current_rsi <= 40) or (side == "SELL" and current_rsi >= 60) ) else 0.5,
+        "pattern": 1.0,
+        "dxy": 1.0 if dxy_bias in {"up", "down"} else 0.5,
+        "news": 1.0 if not news_note.startswith("ADAPTIVE:") else 0.75,
+        "bollinger": 1.0 if ((side == "BUY" and features["bullish_overextension"]) or (side == "SELL" and features["bearish_overextension"])) else 0.5,
+        "liquidity": 1.0 if ((side == "BUY" and features["bullish_sweep"]) or (side == "SELL" and features["bearish_sweep"])) else 0.5,
+    }
+    learning_score = weighted_filter_score(feature_vector)
+    with db() as c:
+        total_samples = int(c.execute("SELECT COALESCE(SUM(samples), 0) FROM filter_weights").fetchone()[0])
+    if total_samples >= LEARNING_MIN_SAMPLES and learning_score < learned_acceptance_threshold():
+        log.info("%s rejected by learned score %.3f", asset, learning_score)
+        return None
     live_bid = pd.to_numeric(data.attrs.get("bid"), errors="coerce")
     live_ask = pd.to_numeric(data.attrs.get("ask"), errors="coerce")
     if side == "BUY" and pd.notna(live_ask):
@@ -358,7 +472,8 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
     source = str(data.attrs.get("source", "Yahoo Finance delayed/read-only"))
     return Signal(asset, side, price, current_rsi, pattern, candle_range, confidence, observed,
                   source=source,
-                  dxy_bias=dxy_bias, correlation_note=correlation_note, news_note=news_note)
+                  dxy_bias=dxy_bias, correlation_note=correlation_note, news_note=news_note,
+                  feature_vector=feature_vector, learning_score=learning_score)
 
 
 def signal_keyboard(signal_id: int) -> InlineKeyboardMarkup:
@@ -576,6 +691,27 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"الذاكرة الحية\nإشارات مسجلة: {total}\nمفتوحة: {open_count or 0}\nخطط حجز أرباح: {plans}\nإشارات مقيمة: {rated}\nمتوسط تقييم المستخدم: {avg_rating:.2f}/5\nمتوسط النتيجة المسجلة: {resolved[1] if resolved[1] is not None else 'لا توجد بيانات'}\nالتقييم التعلمي لا يضمن أداءً مستقبلياً.")
 
 
+async def learning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_chat.id)
+    with db() as c:
+        weights = c.execute("SELECT name,weight,samples FROM filter_weights ORDER BY name").fetchall()
+        wins, losses = c.execute("SELECT SUM(outcome_label='win'), SUM(outcome_label='loss') FROM signals WHERE outcome_label IS NOT NULL").fetchone()
+        by_asset = c.execute("SELECT asset,COUNT(*),SUM(outcome_label='win'),AVG(outcome_r) FROM signals WHERE outcome_label IS NOT NULL GROUP BY asset ORDER BY COUNT(*) DESC LIMIT 8").fetchall()
+        by_side = c.execute("SELECT side,COUNT(*),SUM(outcome_label='win'),AVG(outcome_r) FROM signals WHERE outcome_label IS NOT NULL GROUP BY side").fetchall()
+        by_style = c.execute("SELECT COALESCE(selected_style,'unselected'),COUNT(*),SUM(outcome_label='win'),AVG(outcome_r) FROM signals WHERE outcome_label IS NOT NULL GROUP BY selected_style").fetchall()
+        by_hour = c.execute("SELECT substr(observed_at,12,2),COUNT(*),SUM(outcome_label='win'),AVG(outcome_r) FROM signals WHERE outcome_label IS NOT NULL GROUP BY substr(observed_at,12,2) ORDER BY COUNT(*) DESC LIMIT 8").fetchall()
+        stages = c.execute("SELECT outcome_stage,COUNT(*) FROM signals WHERE outcome_stage IS NOT NULL GROUP BY outcome_stage").fetchall()
+    total = (wins or 0) + (losses or 0)
+    win_rate = (100 * wins / total) if total else 0.0
+    body = "\n".join(f"{name}: {weight:.3f} ({samples} تحديث)" for name, weight, samples in weights)
+    asset_report = "\n".join(f"{asset}: {count} | فوز {win or 0} | متوسط R {avg_r:.2f}" for asset, count, win, avg_r in by_asset) or "لا توجد عينات"
+    side_report = "\n".join(f"{side}: {count} | فوز {win or 0} | متوسط R {avg_r:.2f}" for side, count, win, avg_r in by_side) or "لا توجد عينات"
+    style_report = "\n".join(f"{style}: {count} | فوز {win or 0} | متوسط R {avg_r:.2f}" for style, count, win, avg_r in by_style) or "لا توجد عينات"
+    hour_report = "\n".join(f"UTC {hour}:00: {count} | فوز {win or 0} | متوسط R {avg_r:.2f}" for hour, count, win, avg_r in by_hour) or "لا توجد عينات"
+    stage_report = ", ".join(f"{stage}: {count}" for stage, count in stages) or "لا توجد مراحل"
+    await update.message.reply_text(f"التعلم الذاتي المحافظ\nالنتائج النهائية: {total}\nالفوز: {wins or 0} | الخسارة: {losses or 0}\nWin Rate افتراضي: {win_rate:.1f}%\nعتبة القبول الحالية: {learned_acceptance_threshold():.2f}\nمراحل الأهداف: {stage_report}\n\nحسب الأصل:\n{asset_report}\n\nحسب الاتجاه:\n{side_report}\n\nحسب النمط:\n{style_report}\n\nحسب ساعة الإصدار:\n{hour_report}\n\nأوزان الفلاتر:\n{body}\n\nالتقييم افتراضي من حركة السعر وليس تنفيذًا حقيقيًا.\n\n" + SIGNATURE)
+
+
 async def analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_chat.id)
     await update.message.reply_text(
@@ -604,6 +740,7 @@ async def set_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم إيقاف التنبيهات الدورية." if paused else "تم استئناف التنبيهات الدورية.")
 
 async def periodic_scan(context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(settle_open_signals, {})
     signals = await asyncio.to_thread(scan_assets)
     if not signals: return
     with db() as c: users = c.execute("SELECT chat_id,balance FROM users WHERE paused=0 AND alerts_enabled=1").fetchall()
@@ -618,7 +755,7 @@ def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
     db().close()
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("help", help_cmd)); app.add_handler(CommandHandler("setbalance", setbalance)); app.add_handler(CommandHandler("scan", scan_cmd)); app.add_handler(CommandHandler("watchlist", watchlist)); app.add_handler(CommandHandler("analytics", analytics_cmd)); app.add_handler(CommandHandler("report", report_cmd)); app.add_handler(CommandHandler("performance", performance)); app.add_handler(CommandHandler("pause", set_pause)); app.add_handler(CommandHandler("resume", set_pause))
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("help", help_cmd)); app.add_handler(CommandHandler("setbalance", setbalance)); app.add_handler(CommandHandler("scan", scan_cmd)); app.add_handler(CommandHandler("watchlist", watchlist)); app.add_handler(CommandHandler("analytics", analytics_cmd)); app.add_handler(CommandHandler("report", report_cmd)); app.add_handler(CommandHandler("learning", learning_cmd)); app.add_handler(CommandHandler("performance", performance)); app.add_handler(CommandHandler("pause", set_pause)); app.add_handler(CommandHandler("resume", set_pause))
     app.add_handler(CallbackQueryHandler(targets_callback, pattern=r"^targets:\d+:(scalp|medium|long)$"))
     app.add_handler(CallbackQueryHandler(rating_callback, pattern=r"^rating:\d+:[1-5]$"))
     app.add_handler(CallbackQueryHandler(management_callback, pattern=r"^(reserve|alerts|rate|refresh|context):\d+$"))
