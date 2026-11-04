@@ -3,7 +3,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'test-token')
 import bot
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 def test_asset_coverage():
     assert 'EURUSD' in bot.YAHOO_SYMBOLS
@@ -58,7 +58,7 @@ def test_news_guard_fails_closed_without_calendar(monkeypatch):
 
 def test_live_feed_contract_validates_candles_and_quotes():
     candles = [
-        {'time': f'2026-11-03T20:{i:02d}:00Z', 'open': 1.0, 'high': 1.01, 'low': 0.99, 'close': 1.0 + i / 10000}
+        {'time': (datetime.now(timezone.utc) - timedelta(minutes=29-i)).isoformat(), 'open': 1.0, 'high': 1.01, 'low': 0.99, 'close': 1.0 + i / 10000}
         for i in range(30)
     ]
     frame, observed = bot._normalize_live_payload('EURUSD', {

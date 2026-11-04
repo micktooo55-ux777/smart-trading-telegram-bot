@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TZ = os.getenv("TIMEZONE", "Asia/Riyadh")
-INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
+INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MINUTES", "1"))
 YF_PERIOD = os.getenv("YFINANCE_PERIOD", "5d")
 YF_INTERVAL = os.getenv("YFINANCE_INTERVAL", "15m")
 MAX_AGE_MIN = int(os.getenv("MAX_DATA_AGE_MINUTES", "45"))
@@ -33,6 +33,7 @@ NEWS_FILTER_REQUIRED = os.getenv("NEWS_FILTER_REQUIRED", "1").lower() in {"1", "
 NEWS_EVENTS_FILE = ROOT / os.getenv("NEWS_EVENTS_FILE", "data/news_events.json")
 NEWS_EVENTS_URL = os.getenv("NEWS_EVENTS_URL", "").strip()
 NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
+NEWS_ADAPTIVE = os.getenv("NEWS_ADAPTIVE", "1").lower() in {"1", "true", "yes"}
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
 PRICE_PROVIDER = os.getenv("PRICE_PROVIDER", "yahoo").lower()
 BROKER_FEED_URL = os.getenv("BROKER_FEED_URL", "").strip()
@@ -40,6 +41,7 @@ BROKER_FEED_TOKEN = os.getenv("BROKER_FEED_TOKEN", "").strip()
 BROKER_FEED_TIMEOUT = int(os.getenv("BROKER_FEED_TIMEOUT_SECONDS", "8"))
 ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "1").lower() in {"1", "true", "yes"}
 DB_PATH = ROOT / "data" / "bot.db"
+SIGNATURE = "> Built by Eng. Nafea Abdulrahman Al-Karandi"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smart-bot")
@@ -159,6 +161,8 @@ def news_guard(asset: str, at: Optional[datetime] = None) -> tuple[bool, str]:
             relevant = not currencies or bool(currencies & asset_currencies) or "USD" in currencies
             within = abs((event_time - at).total_seconds()) <= NEWS_BLACKOUT_MIN * 60
             if impact in {"high", "critical", "3"} and relevant and within:
+                if NEWS_ADAPTIVE:
+                    return True, f"ADAPTIVE:{event.get('title', 'عالي التأثير')} حتى {event_time.isoformat()}"
                 return False, f"حظر أخبار {event.get('title', 'عالي التأثير')} حتى {event_time.isoformat()}"
         except (KeyError, TypeError, ValueError):
             continue
@@ -272,12 +276,41 @@ def fetch(symbol: str) -> tuple[pd.DataFrame, str]:
     return data, observed.isoformat()
 
 
+def adaptive_features(data: pd.DataFrame) -> dict[str, bool | float]:
+    close = data["Close"].astype(float)
+    middle = close.rolling(20).mean()
+    deviation = close.rolling(20).std(ddof=0)
+    upper = middle + 2 * deviation
+    lower = middle - 2 * deviation
+    current_rsi = rsi(close)
+    prev, last = data.iloc[-2], data.iloc[-1]
+    rsi_prev, rsi_last = float(current_rsi.iloc[-2]), float(current_rsi.iloc[-1])
+    bullish_sweep = float(last.Low) < float(prev.Low) and float(last.Close) > float(prev.Low)
+    bearish_sweep = float(last.High) > float(prev.High) and float(last.Close) < float(prev.High)
+    bullish_divergence = float(last.Low) < float(prev.Low) and rsi_last > rsi_prev
+    bearish_divergence = float(last.High) > float(prev.High) and rsi_last < rsi_prev
+    return {
+        "ema9": float(close.ewm(span=9, adjust=False).mean().iloc[-1]),
+        "ema21": float(close.ewm(span=21, adjust=False).mean().iloc[-1]),
+        "ema50": float(close.ewm(span=50, adjust=False).mean().iloc[-1]),
+        "upper": float(upper.iloc[-1]),
+        "lower": float(lower.iloc[-1]),
+        "bullish_sweep": bullish_sweep,
+        "bearish_sweep": bearish_sweep,
+        "bullish_divergence": bullish_divergence,
+        "bearish_divergence": bearish_divergence,
+        "bullish_overextension": float(last.Close) <= float(lower.iloc[-1]),
+        "bearish_overextension": float(last.Close) >= float(upper.iloc[-1]),
+    }
+
+
 def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) -> Signal | None:
     data, observed = fetch(symbol)
     close = data["Close"].astype(float)
     data["rsi"] = rsi(close)
     data["ema_fast"] = close.ewm(span=EMA_FAST, adjust=False).mean()
     data["ema_slow"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
+    features = adaptive_features(data)
     prev, last = data.iloc[-2], data.iloc[-1]
     body_prev = abs(float(prev.Close - prev.Open))
     body_last = abs(float(last.Close - last.Open))
@@ -285,8 +318,8 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
     bearish_engulf = prev.Close > prev.Open and last.Close < last.Open and last.Open >= prev.Close and last.Close <= prev.Open and body_last >= body_prev
     current_rsi = float(data["rsi"].iloc[-1])
     side, pattern = None, None
-    bullish_trend = float(last.Close) > float(last.ema_fast) > float(last.ema_slow)
-    bearish_trend = float(last.Close) < float(last.ema_fast) < float(last.ema_slow)
+    bullish_trend = float(last.Close) > features["ema21"] > features["ema50"]
+    bearish_trend = float(last.Close) < features["ema21"] < features["ema50"]
     # The RSI bands are deliberately asymmetric to avoid treating every
     # engulfing candle as a signal in the middle of a range.
     if bullish_engulf and bullish_trend and 30 <= current_rsi <= 48:
@@ -299,6 +332,13 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
     if not news_allowed:
         log.info("%s blocked by news guard: %s", asset, news_note)
         return None
+    if news_note.startswith("ADAPTIVE:"):
+        adaptive_buy = bool(features["bullish_sweep"] and features["bullish_overextension"] and features["bullish_divergence"] and bullish_trend)
+        adaptive_sell = bool(features["bearish_sweep"] and features["bearish_overextension"] and features["bearish_divergence"] and bearish_trend)
+        if (side == "BUY" and not adaptive_buy) or (side == "SELL" and not adaptive_sell):
+            log.info("%s rejected: news-adaptive confluence incomplete", asset)
+            return None
+        pattern += " + News Liquidity Sweep"
     correlation_allowed, dxy_bias, correlation_note = dxy_guard(asset, side, dxy_data)
     if not correlation_allowed:
         log.info("%s blocked by DXY guard: %s", asset, correlation_note)
@@ -355,7 +395,7 @@ def format_signal(sig: Signal, balance: Optional[float]) -> str:
             f"مخاطرة النموذج: {RISK_PCT:.2f}% | {sizing}\n"
             f"الثقة: {sig.confidence}\nDXY: {sig.dxy_bias}\nوقت القراءة UTC: {sig.observed_at}\nالمصدر: {sig.source}\n"
             "اختر نوع الصفقة لحساب SL وTP1 وTP2 وTP3 ديناميكياً:\n"
-            "تنبيه: الأسعار مرجعية وليست MT5 تنفيذية؛ تحقق من السعر والسبريد بنفسك.")
+            "تنبيه: الأسعار مرجعية وليست MT5 تنفيذية؛ تحقق من السعر والسبريد بنفسك.\n\n" + SIGNATURE)
 
 
 def format_targets(asset: str, side: str, entry: float, candle_range: float, style_key: str) -> str:
@@ -396,7 +436,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("مرحباً. هذا بوت تحليل وتنبيهات فقط. استخدم /help ثم /setbalance 1000 لحساب المخاطرة النظرية.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("الأوامر: /setbalance <USD>، /scan، /watchlist، /performance، /pause، /resume. البيانات من Yahoo Finance وقد تكون متأخرة.")
+    await update.message.reply_text("الأوامر: /setbalance <USD>، /scan، /watchlist، /analytics، /report، /performance، /pause، /resume. البيانات من Yahoo Finance وقد تكون مرجعية.")
 
 async def setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_chat.id)
@@ -523,6 +563,28 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plans = c.execute("SELECT COUNT(*) FROM signals WHERE chat_id=? AND profit_reserved=1", (update.effective_chat.id,)).fetchone()[0]
     await update.message.reply_text(f"الذاكرة الحية\nإشارات مسجلة: {total}\nمفتوحة: {open_count or 0}\nخطط حجز أرباح: {plans}\nإشارات مقيمة: {rated}\nمتوسط تقييم المستخدم: {avg_rating:.2f}/5\nمتوسط النتيجة المسجلة: {resolved[1] if resolved[1] is not None else 'لا توجد بيانات'}\nالتقييم التعلمي لا يضمن أداءً مستقبلياً.")
 
+
+async def analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_chat.id)
+    await update.message.reply_text(
+        f"المحرك التكيفي\nالأصول: {len(YAHOO_SYMBOLS)}\nالمؤشرات: EMA9/21/50، RSI، Bollinger Bands، Engulfing\n"
+        f"درع DXY: مفعّل\nالأخبار: {'تكيفي' if NEWS_ADAPTIVE else 'حظر تقليدي'}\nالفحص الدوري: كل {INTERVAL_MIN * 60} ثانية\n"
+        "قرب الخبر العالي يتطلب Sweep + Bollinger overextension + RSI divergence + اتجاه EMA.\n\n" + SIGNATURE
+    )
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ensure_user(update.effective_chat.id)
+    with db() as c:
+        rows = c.execute("SELECT asset,side,rsi,pattern,dxy_bias,rating,status,observed_at FROM signals WHERE chat_id=? ORDER BY id DESC LIMIT 10", (update.effective_chat.id,)).fetchall()
+    if not rows:
+        await update.message.reply_text("لا توجد إشارات مسجلة بعد.\n\n" + SIGNATURE)
+        return
+    lines = ["تقرير آخر الإشارات:"]
+    for asset, side, rsi_value, pattern, dxy_bias, rating, status, observed_at in rows:
+        lines.append(f"{asset} {side} | RSI {rsi_value:.2f} | DXY {dxy_bias or 'n/a'} | تقييم {rating or '-'} | {status} | {observed_at}")
+    await update.message.reply_text("\n".join(lines) + "\n\n" + SIGNATURE)
+
 async def set_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_chat.id)
     paused = 1 if update.message.text.startswith('/pause') else 0
@@ -544,7 +606,7 @@ def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
     db().close()
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("help", help_cmd)); app.add_handler(CommandHandler("setbalance", setbalance)); app.add_handler(CommandHandler("scan", scan_cmd)); app.add_handler(CommandHandler("watchlist", watchlist)); app.add_handler(CommandHandler("performance", performance)); app.add_handler(CommandHandler("pause", set_pause)); app.add_handler(CommandHandler("resume", set_pause))
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("help", help_cmd)); app.add_handler(CommandHandler("setbalance", setbalance)); app.add_handler(CommandHandler("scan", scan_cmd)); app.add_handler(CommandHandler("watchlist", watchlist)); app.add_handler(CommandHandler("analytics", analytics_cmd)); app.add_handler(CommandHandler("report", report_cmd)); app.add_handler(CommandHandler("performance", performance)); app.add_handler(CommandHandler("pause", set_pause)); app.add_handler(CommandHandler("resume", set_pause))
     app.add_handler(CallbackQueryHandler(targets_callback, pattern=r"^targets:\d+:(scalp|medium|long)$"))
     app.add_handler(CallbackQueryHandler(rating_callback, pattern=r"^rating:\d+:[1-5]$"))
     app.add_handler(CallbackQueryHandler(management_callback, pattern=r"^(reserve|alerts|rate|refresh|context):\d+$"))

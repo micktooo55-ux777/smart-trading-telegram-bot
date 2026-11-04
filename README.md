@@ -8,6 +8,8 @@
 - فلترة متعددة: Engulfing + RSI + اتجاه EMA20/EMA50 لتقليل الإشارات داخل النطاقات.
 - درع DXY: يتطلب اتجاهًا مؤكدًا لمؤشر الدولار قبل تمرير إشارات الذهب/الفضة والأزواج المرتبطة بالدولار.
 - فلتر أخبار عالي التأثير بنظام fail-closed؛ عند عدم توفر تقويم موثوق لا يرسل البوت إشارة.
+- عند قرب خبر عالي التأثير، يعمل الوضع التكيفي بدل الحظر: يشترط Liquidity Sweep وBollinger overextension وRSI divergence واتجاه EMA قبل قبول الإشارة.
+- يضيف أوامر `/analytics` و`/report` لتلخيص حالة المحرك والإشارات المقيمة.
 - رموز MT5 قياسية صريحة مثل EURUSD وUSDCAD وUSDJPY وXAUUSD وBTCUSD؛ لا يتم توليد رموز معكوسة تلقائيًا.
 - مخاطرة نموذجية 1% وحجم وحدات/لوت نظري قابل للتهيئة؛ لا يرسل أمرًا.
 - سجل SQLite للإشارات، نتائجها اللاحقة، وتقرير أداء تراكمي.
@@ -58,4 +60,4 @@ bash run_tmux.sh
 
 ## أوامر Telegram
 
-`/start`، `/setbalance 1000`، `/scan`، `/watchlist`، `/performance`، `/pause`، `/resume`، `/help`.
+`/start`، `/setbalance 1000`، `/scan`، `/watchlist`، `/analytics`، `/report`، `/performance`، `/pause`، `/resume`، `/help`.
