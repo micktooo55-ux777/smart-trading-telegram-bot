@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ BROKER_FEED_TIMEOUT = int(os.getenv("BROKER_FEED_TIMEOUT_SECONDS", "8"))
 ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "1").lower() in {"1", "true", "yes"}
 DB_PATH = ROOT / "data" / "bot.db"
 SIGNATURE = "> Built by Eng. Nafea Abdulrahman Al-Karandi"
+MAX_CONCURRENT_FETCHES = max(1, int(os.getenv("MAX_CONCURRENT_FETCHES", "6")))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smart-bot")
@@ -416,19 +418,29 @@ def format_targets(asset: str, side: str, entry: float, candle_range: float, sty
 
 
 def scan_assets() -> list[Signal]:
-    out = []
     try:
         dxy_data, _ = fetch(DXY_SYMBOL)
     except Exception as exc:
         log.warning("DXY shield unavailable; scan blocked: %s", exc)
-        return out
-    for asset, symbol in YAHOO_SYMBOLS.items():
+        return []
+
+    def scan_one(item: tuple[str, str]) -> Signal | None:
+        asset, symbol = item
         try:
             sig = analyze(asset, symbol, dxy_data)
-            if sig:
-                out.append(sig)
         except Exception as e:
             log.debug("%s unavailable: %s", asset, e)
+            return None
+        return sig
+
+    out = []
+    # Parallel I/O reduces scan latency while the worker cap avoids hammering Yahoo.
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as pool:
+        futures = [pool.submit(scan_one, item) for item in YAHOO_SYMBOLS.items()]
+        for future in as_completed(futures):
+            sig = future.result()
+            if sig:
+                out.append(sig)
     return out
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
