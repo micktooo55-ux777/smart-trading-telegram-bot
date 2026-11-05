@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import sqlite3
+import threading
+import time
 from dataclasses import field
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "1").lower() in {"1",
 DB_PATH = ROOT / "data" / "bot.db"
 SIGNATURE = "> Built by Eng. Nafea Abdulrahman Al-Karandi"
 MAX_CONCURRENT_FETCHES = max(1, int(os.getenv("MAX_CONCURRENT_FETCHES", "6")))
+NEWS_CACHE_SECONDS = max(30, int(os.getenv("NEWS_CACHE_SECONDS", "300")))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "0.05"))
 LEARNING_MIN_SCORE = float(os.getenv("LEARNING_MIN_SCORE", "0.55"))
 LEARNING_MIN_SAMPLES = int(os.getenv("LEARNING_MIN_SAMPLES", "20"))
@@ -53,6 +56,9 @@ LEARNING_MIN_WEIGHT = float(os.getenv("LEARNING_MIN_WEIGHT", "0.25"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smart-bot")
+_news_cache_lock = threading.Lock()
+_news_cache: tuple[float, list[dict]] | None = None
+_scan_lock = asyncio.Lock()
 
 # Canonical MT5 symbols: base currency first, quote currency second.
 # Yahoo tickers are only the read-only data adapter; execution/quotes are not MT5.
@@ -100,7 +106,8 @@ TRADE_STYLES = {
 
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS users(chat_id INTEGER PRIMARY KEY, balance REAL, paused INTEGER DEFAULT 0, created_at TEXT NOT NULL);
@@ -229,6 +236,11 @@ def settle_open_signals(prices: dict[str, float]) -> int:
 
 def _load_news_events() -> list[dict]:
     """Load a normalized economic-calendar JSON list; never invent missing events."""
+    global _news_cache
+    now = time.monotonic()
+    with _news_cache_lock:
+        if _news_cache and now - _news_cache[0] < NEWS_CACHE_SECONDS:
+            return list(_news_cache[1])
     try:
         if NEWS_EVENTS_URL:
             request = Request(NEWS_EVENTS_URL, headers={"User-Agent": "smart-trading-telegram-bot/1.0"})
@@ -239,9 +251,14 @@ def _load_news_events() -> list[dict]:
         else:
             return []
         events = payload.get("events", payload) if isinstance(payload, dict) else payload
-        return [event for event in events if isinstance(event, dict)]
+        normalized = [event for event in events if isinstance(event, dict)]
+        with _news_cache_lock:
+            _news_cache = (time.monotonic(), normalized)
+        return list(normalized)
     except Exception as exc:
         log.warning("news calendar unavailable: %s", exc)
+        with _news_cache_lock:
+            _news_cache = (time.monotonic(), [])
         return []
 
 
@@ -740,15 +757,31 @@ async def set_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم إيقاف التنبيهات الدورية." if paused else "تم استئناف التنبيهات الدورية.")
 
 async def periodic_scan(context: ContextTypes.DEFAULT_TYPE):
-    await asyncio.to_thread(settle_open_signals, {})
-    signals = await asyncio.to_thread(scan_assets)
-    if not signals: return
-    with db() as c: users = c.execute("SELECT chat_id,balance FROM users WHERE paused=0 AND alerts_enabled=1").fetchall()
-    for chat_id, balance in users:
-        for sig in signals[:5]:
-            signal_id = save_signal(chat_id, sig)
-            try: await context.bot.send_message(chat_id, format_signal(sig, balance), reply_markup=signal_keyboard(signal_id))
-            except Exception: log.exception("telegram send failed for %s", chat_id)
+    if _scan_lock.locked():
+        log.warning("skipping overlapping scan cycle")
+        return
+    async with _scan_lock:
+        started = time.monotonic()
+        try:
+            await asyncio.to_thread(settle_open_signals, {})
+            signals = await asyncio.to_thread(scan_assets)
+            if not signals:
+                return
+            with db() as c:
+                users = c.execute("SELECT chat_id,balance FROM users WHERE paused=0 AND alerts_enabled=1").fetchall()
+            for chat_id, balance in users:
+                for sig in signals[:5]:
+                    try:
+                        signal_id = save_signal(chat_id, sig)
+                        await context.bot.send_message(chat_id, format_signal(sig, balance), reply_markup=signal_keyboard(signal_id))
+                    except Exception:
+                        log.exception("failed to record/send signal for %s", chat_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("periodic scan failed; JobQueue will continue")
+        finally:
+            log.info("scan cycle finished in %.1fs", time.monotonic() - started)
 
 
 def main():
