@@ -5,8 +5,6 @@ import json
 import logging
 import os
 import sqlite3
-import threading
-import time
 from dataclasses import field
 from urllib.request import Request, urlopen
 from dataclasses import dataclass
@@ -33,11 +31,6 @@ EMA_FAST = int(os.getenv("EMA_FAST", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 CONTRACT_UNITS_PER_LOT = float(os.getenv("CONTRACT_UNITS_PER_LOT", "100000"))
 PRICE_VALUE_PER_UNIT = float(os.getenv("PRICE_VALUE_PER_UNIT", "1.0"))
-NEWS_FILTER_REQUIRED = os.getenv("NEWS_FILTER_REQUIRED", "1").lower() in {"1", "true", "yes"}
-NEWS_EVENTS_FILE = ROOT / os.getenv("NEWS_EVENTS_FILE", "data/news_events.json")
-NEWS_EVENTS_URL = os.getenv("NEWS_EVENTS_URL", "").strip()
-NEWS_BLACKOUT_MIN = int(os.getenv("NEWS_BLACKOUT_MINUTES", "30"))
-NEWS_ADAPTIVE = os.getenv("NEWS_ADAPTIVE", "1").lower() in {"1", "true", "yes"}
 DXY_SYMBOL = os.getenv("DXY_SYMBOL", "DX-Y.NYB")
 PRICE_PROVIDER = os.getenv("PRICE_PROVIDER", "yahoo").lower()
 BROKER_FEED_URL = os.getenv("BROKER_FEED_URL", "").strip()
@@ -47,7 +40,6 @@ ALLOW_PUBLIC_FALLBACK = os.getenv("ALLOW_PUBLIC_FALLBACK", "1").lower() in {"1",
 DB_PATH = ROOT / "data" / "bot.db"
 SIGNATURE = "> Built by Eng. Nafea Abdulrahman Al-Karandi"
 MAX_CONCURRENT_FETCHES = max(1, int(os.getenv("MAX_CONCURRENT_FETCHES", "6")))
-NEWS_CACHE_SECONDS = max(30, int(os.getenv("NEWS_CACHE_SECONDS", "300")))
 LEARNING_RATE = float(os.getenv("LEARNING_RATE", "0.05"))
 LEARNING_MIN_SCORE = float(os.getenv("LEARNING_MIN_SCORE", "0.55"))
 LEARNING_MIN_SAMPLES = int(os.getenv("LEARNING_MIN_SAMPLES", "20"))
@@ -56,8 +48,6 @@ LEARNING_MIN_WEIGHT = float(os.getenv("LEARNING_MIN_WEIGHT", "0.25"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smart-bot")
-_news_cache_lock = threading.Lock()
-_news_cache: tuple[float, list[dict]] | None = None
 _scan_lock = asyncio.Lock()
 
 # Canonical MT5 symbols: base currency first, quote currency second.
@@ -92,7 +82,6 @@ class Signal:
     source: str = "broker_live_feed"
     dxy_bias: str = "unknown"
     correlation_note: str = ""
-    news_note: str = ""
     feature_vector: dict[str, float] = field(default_factory=dict)
     learning_score: float = 0.0
 
@@ -123,7 +112,6 @@ def db():
         "last_refresh": "TEXT",
         "dxy_bias": "TEXT",
         "correlation_note": "TEXT",
-        "news_note": "TEXT",
         "feature_vector": "TEXT",
         "learning_score": "REAL",
         "outcome_r": "REAL",
@@ -135,7 +123,7 @@ def db():
         "tp2_at": "TEXT",
         "tp3_at": "TEXT",
     })
-    for name in ("trend", "rsi", "pattern", "dxy", "news", "bollinger", "liquidity"):
+    for name in ("trend", "rsi", "pattern", "dxy", "bollinger", "liquidity"):
         conn.execute("INSERT OR IGNORE INTO filter_weights(name, weight, samples, updated_at) VALUES (?, 1.0, 0, ?)", (name, now_iso()))
     return conn
 
@@ -234,59 +222,6 @@ def settle_open_signals(prices: dict[str, float]) -> int:
     return len(resolved)
 
 
-def _load_news_events() -> list[dict]:
-    """Load a normalized economic-calendar JSON list; never invent missing events."""
-    global _news_cache
-    now = time.monotonic()
-    with _news_cache_lock:
-        if _news_cache and now - _news_cache[0] < NEWS_CACHE_SECONDS:
-            return list(_news_cache[1])
-    try:
-        if NEWS_EVENTS_URL:
-            request = Request(NEWS_EVENTS_URL, headers={"User-Agent": "smart-trading-telegram-bot/1.0"})
-            with urlopen(request, timeout=8) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        elif NEWS_EVENTS_FILE.exists():
-            payload = json.loads(NEWS_EVENTS_FILE.read_text(encoding="utf-8"))
-        else:
-            return []
-        events = payload.get("events", payload) if isinstance(payload, dict) else payload
-        normalized = [event for event in events if isinstance(event, dict)]
-        with _news_cache_lock:
-            _news_cache = (time.monotonic(), normalized)
-        return list(normalized)
-    except Exception as exc:
-        log.warning("news calendar unavailable: %s", exc)
-        with _news_cache_lock:
-            _news_cache = (time.monotonic(), [])
-        return []
-
-
-def news_guard(asset: str, at: Optional[datetime] = None) -> tuple[bool, str]:
-    """Return (allowed, note). Missing data blocks when NEWS_FILTER_REQUIRED is enabled."""
-    events = _load_news_events()
-    if not events:
-        return (not NEWS_FILTER_REQUIRED, "لا يوجد تقويم أخبار موثوق متاح")
-    at = at or datetime.now(timezone.utc)
-    for event in events:
-        try:
-            impact = str(event.get("impact", "")).lower()
-            event_time = datetime.fromisoformat(str(event["time"]).replace("Z", "+00:00"))
-            if event_time.tzinfo is None:
-                event_time = event_time.replace(tzinfo=timezone.utc)
-            currencies = {str(x).upper() for x in event.get("currencies", [])}
-            asset_currencies = {asset[:3], asset[3:6]} if len(asset) >= 6 else set()
-            relevant = not currencies or bool(currencies & asset_currencies) or "USD" in currencies
-            within = abs((event_time - at).total_seconds()) <= NEWS_BLACKOUT_MIN * 60
-            if impact in {"high", "critical", "3"} and relevant and within:
-                if NEWS_ADAPTIVE:
-                    return True, f"ADAPTIVE:{event.get('title', 'عالي التأثير')} حتى {event_time.isoformat()}"
-                return False, f"حظر أخبار {event.get('title', 'عالي التأثير')} حتى {event_time.isoformat()}"
-        except (KeyError, TypeError, ValueError):
-            continue
-    return True, "لا يوجد إصدار عالي التأثير ضمن نافذة الحظر"
-
-
 def dxy_guard(asset: str, side: str, dxy_data: Optional[pd.DataFrame]) -> tuple[bool, str, str]:
     """Confirm USD-correlated assets against DXY EMA direction."""
     if dxy_data is None or dxy_data.empty:
@@ -311,8 +246,8 @@ def dxy_guard(asset: str, side: str, dxy_data: Optional[pd.DataFrame]) -> tuple[
 def save_signal(chat_id: int, sig: Signal) -> int:
     with db() as c:
         cur = c.execute(
-            "INSERT INTO signals(chat_id,asset,side,price,rsi,pattern,stop_distance,risk_pct,observed_at,dxy_bias,correlation_note,news_note,feature_vector,learning_score) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (chat_id, sig.asset, sig.side, sig.price, sig.rsi, sig.pattern, sig.stop_distance, RISK_PCT, sig.observed_at, sig.dxy_bias, sig.correlation_note, sig.news_note, json.dumps(sig.feature_vector), sig.learning_score),
+            "INSERT INTO signals(chat_id,asset,side,price,rsi,pattern,stop_distance,risk_pct,observed_at,dxy_bias,correlation_note,feature_vector,learning_score) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, sig.asset, sig.side, sig.price, sig.rsi, sig.pattern, sig.stop_distance, RISK_PCT, sig.observed_at, sig.dxy_bias, sig.correlation_note, json.dumps(sig.feature_vector), sig.learning_score),
         )
         return int(cur.lastrowid)
 
@@ -446,17 +381,6 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
         side, pattern = "SELL", "Bearish Engulfing"
     if not side:
         return None
-    news_allowed, news_note = news_guard(asset)
-    if not news_allowed:
-        log.info("%s blocked by news guard: %s", asset, news_note)
-        return None
-    if news_note.startswith("ADAPTIVE:"):
-        adaptive_buy = bool(features["bullish_sweep"] and features["bullish_overextension"] and features["bullish_divergence"] and bullish_trend)
-        adaptive_sell = bool(features["bearish_sweep"] and features["bearish_overextension"] and features["bearish_divergence"] and bearish_trend)
-        if (side == "BUY" and not adaptive_buy) or (side == "SELL" and not adaptive_sell):
-            log.info("%s rejected: news-adaptive confluence incomplete", asset)
-            return None
-        pattern += " + News Liquidity Sweep"
     correlation_allowed, dxy_bias, correlation_note = dxy_guard(asset, side, dxy_data)
     if not correlation_allowed:
         log.info("%s blocked by DXY guard: %s", asset, correlation_note)
@@ -466,7 +390,6 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
         "rsi": 1.0 if ((side == "BUY" and current_rsi <= 40) or (side == "SELL" and current_rsi >= 60) ) else 0.5,
         "pattern": 1.0,
         "dxy": 1.0 if dxy_bias in {"up", "down"} else 0.5,
-        "news": 1.0 if not news_note.startswith("ADAPTIVE:") else 0.75,
         "bollinger": 1.0 if ((side == "BUY" and features["bullish_overextension"]) or (side == "SELL" and features["bearish_overextension"])) else 0.5,
         "liquidity": 1.0 if ((side == "BUY" and features["bullish_sweep"]) or (side == "SELL" and features["bearish_sweep"])) else 0.5,
     }
@@ -489,7 +412,7 @@ def analyze(asset: str, symbol: str, dxy_data: Optional[pd.DataFrame] = None) ->
     source = str(data.attrs.get("source", "Yahoo Finance delayed/read-only"))
     return Signal(asset, side, price, current_rsi, pattern, candle_range, confidence, observed,
                   source=source,
-                  dxy_bias=dxy_bias, correlation_note=correlation_note, news_note=news_note,
+                  dxy_bias=dxy_bias, correlation_note=correlation_note,
                   feature_vector=feature_vector, learning_score=learning_score)
 
 
@@ -500,7 +423,7 @@ def signal_keyboard(signal_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(TRADE_STYLES["long"]["label"], callback_data=f"targets:{signal_id}:long")],
         [InlineKeyboardButton("🔄 تحديث التحليل", callback_data=f"refresh:{signal_id}"), InlineKeyboardButton("🔔 التنبيهات", callback_data=f"alerts:{signal_id}")],
         [InlineKeyboardButton("💰 حجز الأرباح (خطة)", callback_data=f"reserve:{signal_id}")],
-        [InlineKeyboardButton("🛡️ الارتباط والأخبار", callback_data=f"context:{signal_id}")],
+        [InlineKeyboardButton("🛡️ ارتباط DXY", callback_data=f"context:{signal_id}")],
         [InlineKeyboardButton("⭐ قيّم الإشارة", callback_data=f"rate:{signal_id}")],
     ])
 
@@ -515,7 +438,7 @@ def management_keyboard(signal_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 تحديث التحليل", callback_data=f"refresh:{signal_id}"), InlineKeyboardButton("🔔 التنبيهات", callback_data=f"alerts:{signal_id}")],
         [InlineKeyboardButton("💰 حجز الأرباح (خطة)", callback_data=f"reserve:{signal_id}"), InlineKeyboardButton("⭐ تقييم", callback_data=f"rate:{signal_id}")],
-        [InlineKeyboardButton("🛡️ الارتباط والأخبار", callback_data=f"context:{signal_id}")],
+        [InlineKeyboardButton("🛡️ ارتباط DXY", callback_data=f"context:{signal_id}")],
     ])
 
 
@@ -643,10 +566,10 @@ async def management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if action == "context":
         with db() as c:
-            context_row = c.execute("SELECT dxy_bias,correlation_note,news_note FROM signals WHERE id=?", (signal_id,)).fetchone()
-        dxy_bias, correlation_note, news_note = context_row or ("unknown", "غير متاح", "غير متاح")
+            context_row = c.execute("SELECT dxy_bias,correlation_note FROM signals WHERE id=?", (signal_id,)).fetchone()
+        dxy_bias, correlation_note = context_row or ("unknown", "غير متاح")
         await query.message.reply_text(
-            f"درع السوق — {row[1]}\nDXY: {dxy_bias or 'unknown'}\nالارتباط: {correlation_note or 'غير متاح'}\nالأخبار: {news_note or 'غير متاح'}\n\nهذه قراءة مرجعية وليست ضماناً ضد الانعكاس.",
+            f"درع السوق الفني — {row[1]}\nDXY: {dxy_bias or 'unknown'}\nالارتباط: {correlation_note or 'غير متاح'}\n\nهذه قراءة فنية مرجعية وليست ضماناً ضد الانعكاس.",
             reply_markup=management_keyboard(signal_id),
         )
     elif action == "reserve":
@@ -733,8 +656,8 @@ async def analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update.effective_chat.id)
     await update.message.reply_text(
         f"المحرك التكيفي\nالأصول: {len(YAHOO_SYMBOLS)}\nالمؤشرات: EMA9/21/50، RSI، Bollinger Bands، Engulfing\n"
-        f"درع DXY: مفعّل\nالأخبار: {'تكيفي' if NEWS_ADAPTIVE else 'حظر تقليدي'}\nالفحص الدوري: كل {INTERVAL_MIN * 60} ثانية\n"
-        "قرب الخبر العالي يتطلب Sweep + Bollinger overextension + RSI divergence + اتجاه EMA.\n\n" + SIGNATURE
+        f"درع DXY: مفعّل\nالفحص الدوري: كل {INTERVAL_MIN * 60} ثانية\n"
+        "المحرك الفني يستخدم Sweep + Bollinger + RSI divergence + اتجاه EMA عند توفرها.\n\n" + SIGNATURE
     )
 
 

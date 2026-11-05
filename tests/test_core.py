@@ -49,13 +49,6 @@ def test_dxy_guard_blocks_gold_when_bias_conflicts():
     assert allowed is False
     assert 'DXY=up' in note
 
-def test_news_guard_fails_closed_without_calendar(monkeypatch):
-    monkeypatch.setattr(bot, 'NEWS_FILTER_REQUIRED', True)
-    monkeypatch.setattr(bot, '_load_news_events', lambda: [])
-    allowed, note = bot.news_guard('EURUSD', datetime.now(timezone.utc))
-    assert allowed is False
-    assert 'تقويم أخبار' in note
-
 def test_live_feed_contract_validates_candles_and_quotes():
     candles = [
         {'time': (datetime.now(timezone.utc) - timedelta(minutes=29-i)).isoformat(), 'open': 1.0, 'high': 1.01, 'low': 0.99, 'close': 1.0 + i / 10000}
